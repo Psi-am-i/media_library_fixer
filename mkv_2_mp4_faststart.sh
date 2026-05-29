@@ -47,10 +47,8 @@ log(){ printf '%s\n' "$*" >&2; }
 ts(){ date +%H:%M:%S; }
 problem(){ printf '%s\t%s\n' "$2" "$1" >> "$PROBLEM_LOG"; }
 
-# Show minimal ffmpeg progress (speed + time) without full spam
 ff_run() {
-  # -stats prints a single updating line; -loglevel error keeps it clean
-  "$FFMPEG" -nostdin -hide_banner -loglevel error -stats "$@"
+  "$FFMPEG" -nostdin -hide_banner -loglevel error "$@"
 }
 
 # Returns 0 if "moov" appears before "mdat" in first few MB (faststart), else 1
@@ -136,7 +134,7 @@ process_one_mkv() {
     rm -f "$tmp" || true
   fi
 
-  # 4) Export text subtitles to sidecar SRTs (quiet)
+  # 4) Export text subtitles to sidecar SRTs — single pass over source for all tracks
   log "$(ts) SUBS  : extracting (if any)"
   local subcodecs
   subcodecs="$("$FFPROBE" -v error -select_streams s \
@@ -144,7 +142,7 @@ process_one_mkv() {
       -of csv=p=0 "$file" || true)"
 
   if [[ -n "$subcodecs" ]]; then
-    local i=0
+    local i=0 srt_args=()
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
       local idx codec lang
@@ -152,16 +150,23 @@ process_one_mkv() {
       codec="$(echo "$line" | cut -d',' -f2)"
       lang="$(echo "$line" | cut -d',' -f3)"
       lang="${lang:-und}"
-
       case "$codec" in
         subrip|ass|ssa|webvtt|mov_text|text)
           local srt="${out%.mp4}.sub$(printf '%02d' "$i").${lang}.srt"
-          "$FFMPEG" -nostdin -hide_banner -loglevel error -y -i "$file" \
-            -map 0:"$idx" -c:s srt "$srt" || true
+          srt_args+=(-map "0:${idx}" -c:s srt "$srt")
           i=$((i+1))
           ;;
       esac
     done <<< "$subcodecs"
+
+    if [[ "${#srt_args[@]}" -gt 0 ]]; then
+      "$FFMPEG" -nostdin -hide_banner -loglevel error -y -i "$file" "${srt_args[@]}" || true
+      log "$(ts) SUBS  : extracted ${i} track(s)"
+    else
+      log "$(ts) SUBS  : none (no text-based tracks)"
+    fi
+  else
+    log "$(ts) SUBS  : none"
   fi
 
   # 5) Delete MKV if MP4 created
