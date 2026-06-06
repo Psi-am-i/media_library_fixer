@@ -3,58 +3,81 @@
 # everything_2_faststart_mp4.sh — Convert/remux video files to faststart MP4
 #
 # USAGE:
-#   ./everything_2_faststart_mp4.sh [SRC] [DST] [JOBS]
+#   ./everything_2_faststart_mp4.sh [SRC]
 #
-#   SRC   Source directory (default: current directory)
-#   DST   Destination directory (default: same as SRC)
-#   JOBS  Parallel jobs (default: 2)
-#
-# ENV VARS (skip the interactive prompts):
-#   MODE=remux|faststart|both   Processing mode (default: both)
-#   DELETE_SOURCE=0|1           Delete source after conversion (default: 0)
+#   SRC   Directory to scan (default: current directory)
 #
 # GRACEFUL STOP:
-#   touch /tmp/mp4_stop       — finish current file(s), skip the rest
-#   rm /tmp/mp4_stop          — clear the stop flag to resume/re-run
-#
-# EXAMPLES:
-#   ./everything_2_faststart_mp4.sh /Volumes/Media /Volumes/Media 4
-#   MODE=faststart ./everything_2_faststart_mp4.sh /Volumes/Media
+#   touch /tmp/mp4_stop      — finish current file(s), skip the rest
+#   rm /tmp/mp4_stop         — clear the stop flag to resume/re-run
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SRC="${1:-.}"
 SRC="${SRC%/}"
-DST="${2:-$SRC}"
-DST="${DST%/}"
-JOBS="${3:-2}"                     # Safe default for RAID/NFS
 TMPROOT="/tmp/mp4work"
-DELETE_SOURCE="${DELETE_SOURCE:-0}" # Set to 1 to remove source after successful conversion
 
-# Honour pre-set env vars; otherwise ask interactively.
-# MODE=remux    → convert MKV/legacy to MP4, skip faststart
-# MODE=faststart → apply faststart to existing MP4s only, skip MKV/legacy
-# MODE=both     → convert then faststart (original behaviour)
-if [[ -z "${MODE:-}" ]]; then
-  printf '\nProcessing mode:\n  1) Remux / re-encode only  (no faststart)\n  2) Faststart only          (existing MP4s — skips MKV/AVI/etc)\n  3) Both — remux + faststart  [default]\n' >&2
-  read -r -p "  Choice [1/2/3]: " _choice </dev/tty 2>/dev/tty || _choice=3
-  case "${_choice:-3}" in
-    1) MODE=remux ;;
-    2) MODE=faststart ;;
-    *) MODE=both ;;
-  esac
-fi
+# ── Interactive prompts ───────────────────────────────────────────────────────
+
+printf '\nProcessing mode:\n  1) Remux / re-encode only  (MKV/AVI/WMV → MP4, no faststart pass)\n  2) Faststart only          (fix moov placement on existing MP4s)\n  3) Both — remux then faststart  [default]\n' >&2
+read -r -p "  Choice [1/2/3]: " _mchoice </dev/tty 2>/dev/tty || _mchoice=3
+case "${_mchoice:-3}" in
+  1) MODE=remux ;;
+  2) MODE=faststart ;;
+  *) MODE=both ;;
+esac
 export MODE
 
-if [[ -z "${DELETE_SOURCE_SET:-}" ]]; then
-  printf '\nDelete source file after successful conversion?\n  1) Keep source  [default]\n  2) Delete source\n' >&2
-  read -r -p "  Choice [1/2]: " _del </dev/tty 2>/dev/tty || _del=1
-  case "${_del:-1}" in
-    2) DELETE_SOURCE=1 ;;
-    *) DELETE_SOURCE=0 ;;
-  esac
+printf '\nWhere should the new file be written?\n  1) Replace source in place  [default]\n  2) Write to a separate folder\n' >&2
+read -r -p "  Choice [1/2]: " _ochoice </dev/tty 2>/dev/tty || _ochoice=1
+case "${_ochoice:-1}" in
+  2)
+    OUTPUT_MODE=separate
+    printf '\nDestination folder for new files?\n  (default: %s/new versions)\n' "$SRC" >&2
+    read -r -p "  Path: " _opath </dev/tty 2>/dev/tty || _opath=""
+    OUTPUT_DIR="${_opath:-$SRC/new versions}"
+    printf '\nFolder structure in destination?\n  1) Mirror source folder structure  [default]\n  2) Flat — all files in destination root\n' >&2
+    read -r -p "  Choice [1/2]: " _fchoice </dev/tty 2>/dev/tty || _fchoice=1
+    case "${_fchoice:-1}" in
+      2) OUTPUT_FLAT=1 ;;
+      *) OUTPUT_FLAT=0 ;;
+    esac
+    ;;
+  *)
+    OUTPUT_MODE=inplace
+    OUTPUT_DIR="$SRC"
+    OUTPUT_FLAT=0
+    ;;
+esac
+export OUTPUT_MODE OUTPUT_DIR OUTPUT_FLAT
+
+printf '\nWhat should happen to the original file?\n  1) Archive (move to a folder)  [default]\n  2) Delete\n  3) Leave it where it is\n' >&2
+read -r -p "  Choice [1/2/3]: " _schoice </dev/tty 2>/dev/tty || _schoice=1
+case "${_schoice:-1}" in
+  2) SOURCE_ACTION=delete ;;
+  3) SOURCE_ACTION=keep ;;
+  *) SOURCE_ACTION=archive ;;
+esac
+
+if [[ "$SOURCE_ACTION" == "archive" ]]; then
+  printf '\nWhere should originals be archived?\n  (default: %s/originals)\n' "$SRC" >&2
+  read -r -p "  Path: " _apath </dev/tty 2>/dev/tty || _apath=""
+  ARCHIVE_DIR="${_apath:-$SRC/originals}"
+else
+  ARCHIVE_DIR=""
 fi
-export DELETE_SOURCE
+export SOURCE_ACTION ARCHIVE_DIR
+
+printf '\nParallel jobs?\n  1) 1 job\n  2) 2 jobs  [default]\n  3) 4 jobs\n' >&2
+read -r -p "  Choice [1/2/3]: " _jchoice </dev/tty 2>/dev/tty || _jchoice=2
+case "${_jchoice:-2}" in
+  1) JOBS=1 ;;
+  3) JOBS=4 ;;
+  *) JOBS=2 ;;
+esac
+export JOBS
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
 
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
@@ -66,6 +89,13 @@ STOP_FILE="/tmp/mp4_stop"
 export PROBLEM_LOG STOP_FILE
 trap 'rm -f "$PROBLEM_LOG"' EXIT
 
+TTY=/dev/tty
+log(){ printf '%s\n' "$*" > "$TTY"; }
+ts(){ date +%H:%M:%S; }
+problem(){ printf '%s\t%s\n' "$2" "$1" >> "$PROBLEM_LOG"; }
+fsize(){ du -sh "$1" 2>/dev/null | awk '{print $1}'; }
+sname(){ local b; b="$(basename "$1")"; printf '%s' "${b%.*}"; }
+
 check_stop_requested() {
   if [[ -f "$STOP_FILE" ]]; then
     log "$(ts) STOP  : stop file found ($STOP_FILE) — skipping remaining files"
@@ -74,18 +104,8 @@ check_stop_requested() {
   return 1
 }
 
-TTY=/dev/tty
-log(){ printf '%s\n' "$*" > "$TTY"; }
-ts(){ date +%H:%M:%S; }
-problem(){ printf '%s\t%s\n' "$2" "$1" >> "$PROBLEM_LOG"; }
-fsize(){ du -sh "$1" 2>/dev/null | awk '{print $1}'; }
-# Short display name: filename without path or extension
-sname(){ local b; b="$(basename "$1")"; printf '%s' "${b%.*}"; }
-
 # Progress-aware ffmpeg wrapper.
 #   ff_run_progress LABEL DURATION_SECS START_TS [ffmpeg args...]
-# Writes progress to a temp file via -progress, spawns a monitor,
-# cleans up on exit.  Returns ffmpeg's exit code.
 ff_run_progress() {
   local label="$1" dur_secs="$2" start_ts="$3"
   shift 3
@@ -94,11 +114,9 @@ ff_run_progress() {
   _e=$(mktemp /tmp/fferr.XXXXXX)
   _prog=$(mktemp /tmp/ffprog.XXXXXX)
 
-  # Stagger reporting: 1 job → 10s; >1 job → 20s with per-file offset
   local interval offset monitor_pid
   if [[ "${JOBS:-2}" -le 1 ]]; then
-    interval=10
-    offset=0
+    interval=10; offset=0
   else
     interval=20
     offset=$(( $(printf '%s' "$label" | cksum | awk '{print $1}') % interval ))
@@ -113,7 +131,9 @@ ff_run_progress() {
       speed=$(grep       '^speed='       "$_prog" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
       bitrate=$(grep     '^bitrate='     "$_prog" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
       elapsed=$(( $(date +%s) - start_ts ))
-      if [[ -n "$out_time_us" && "$out_time_us" =~ ^[0-9]+$ &&             -n "$dur_secs"    && "$dur_secs"    =~ ^[0-9]+$  &&             "$dur_secs" -gt 0 ]]; then
+      if [[ -n "$out_time_us" && "$out_time_us" =~ ^[0-9]+$ && \
+            -n "$dur_secs"    && "$dur_secs"    =~ ^[0-9]+$  && \
+            "$dur_secs" -gt 0 ]]; then
         local done_secs=$(( out_time_us / 1000000 ))
         local pct
         pct=$(python3 -c "print(f'{min($done_secs/$dur_secs*100,100):.1f}')")
@@ -138,7 +158,9 @@ else:
     done ) &
   monitor_pid=$!
 
-  "$FFMPEG" -nostdin -hide_banner -loglevel error     -progress "$_prog" -stats_period 2     "$@" 2>"$_e"
+  "$FFMPEG" -nostdin -hide_banner -loglevel error \
+    -progress "$_prog" -stats_period 2 \
+    "$@" 2>"$_e"
   _rc=$?
 
   kill "$monitor_pid" 2>/dev/null
@@ -155,7 +177,7 @@ else:
   return "$_rc"
 }
 
-# Plain wrapper — no progress monitoring (used for faststart pass and subtitle extract)
+# Plain wrapper — no progress monitoring (faststart pass, subtitle extract)
 ff_run() {
   local _e _rc
   _e=$(mktemp /tmp/fferr.XXXXXX)
@@ -172,7 +194,7 @@ ff_run() {
   return "$_rc"
 }
 
-# Returns 0 if "moov" appears before "mdat" in first few MB (faststart), else 1
+# Returns 0 if "moov" appears before "mdat" in first few MB (already faststart)
 is_faststart() {
   local f="$1"
   python3 - "$f" <<'PY'
@@ -188,31 +210,67 @@ PY
 export -f is_faststart
 
 # Returns 0 if the primary video codec cannot be stream-copied into MP4
-# (WMV/VC1 family and old MS-MPEG4 variants are container-incompatible)
 needs_transcode_video() {
   local f="$1"
   local vcodec
   vcodec="$("$FFPROBE" -v error -select_streams v:0 \
       -show_entries stream=codec_name -of csv=p=0 "$f" 2>/dev/null | head -1)"
   case "$vcodec" in
-    wmv1|wmv2|wmv3|vc1|msmpeg4v1|msmpeg4v2|msmpeg4v3|msmpeg4)
-      return 0 ;;
-    *)
-      return 1 ;;
+    wmv1|wmv2|wmv3|vc1|msmpeg4v1|msmpeg4v2|msmpeg4v3|msmpeg4) return 0 ;;
+    *) return 1 ;;
   esac
 }
 export -f needs_transcode_video
 
-process_one_mkv() {
-  local src="$1" dst="$2" file="$3"
+# ── Shared source-handling after successful output ────────────────────────────
+handle_source() {
+  local file="$1" out="$2" rel="$3" elapsed="$4"
+  local n; n="$(sname "$file")"
+  case "${SOURCE_ACTION:-archive}" in
+    delete)
+      [[ "$file" != "$out" ]] && rm -f "$file"
+      log "$(ts) DONE  : ${elapsed}s  [$(fsize "$out")]  $n  (original deleted)"
+      ;;
+    archive)
+      local arc_rel arc_dest
+      arc_rel="$(dirname "$rel")"
+      arc_dest="${ARCHIVE_DIR}${arc_rel:+/$arc_rel}"
+      mkdir -p "$arc_dest"
+      [[ "$file" != "$out" ]] && mv -f "$file" "$arc_dest/$(basename "$file")"
+      log "$(ts) DONE  : ${elapsed}s  [$(fsize "$out")]  $n  (original → $(basename "$ARCHIVE_DIR"))"
+      ;;
+    keep)
+      log "$(ts) DONE  : ${elapsed}s  [$(fsize "$out")]  $n"
+      ;;
+  esac
+}
+export -f handle_source
 
-  if [[ "${MODE:-both}" == "faststart" ]]; then
-    return 0
+# ── Compute output path ───────────────────────────────────────────────────────
+output_path() {
+  local src="$1" file="$2" new_ext="$3"
+  local rel; rel="${file#"$src"/}"
+  if [[ "${OUTPUT_MODE:-inplace}" == "separate" ]]; then
+    if [[ "${OUTPUT_FLAT:-0}" == "1" ]]; then
+      echo "${OUTPUT_DIR}/$(basename "${rel%.*}")${new_ext}"
+    else
+      echo "${OUTPUT_DIR}/${rel%.*}${new_ext}"
+    fi
+  else
+    echo "${src}/${rel%.*}${new_ext}"
   fi
+}
+export -f output_path
 
-  local rel out base tmp tmpfs start n
+# ── Process MKV ──────────────────────────────────────────────────────────────
+process_one_mkv() {
+  local src="$1" file="$2"
+
+  if [[ "${MODE:-both}" == "faststart" ]]; then return 0; fi
+
+  local rel out n
   rel="${file#"$src"/}"
-  out="$dst/${rel%.mkv}.mp4"
+  out="$(output_path "$src" "$file" .mp4)"
   n="$(sname "$file")"
 
   mkdir -p "$(dirname "$out")"
@@ -224,11 +282,12 @@ process_one_mkv() {
 
   if check_stop_requested; then return 0; fi
 
+  local base tmp tmpfs start
   base="$(basename "${out%.mp4}")"
   tmp="$TMPROOT/${base}.$$.$RANDOM.mp4"
   tmpfs="$TMPROOT/${base}.$$.$RANDOM.fs.mp4"
-
   start="$(date +%s)"
+
   log "$(ts) START : [$(fsize "$file")]  $n"
 
   local dur_raw dur_secs
@@ -239,7 +298,6 @@ process_one_mkv() {
     dur_secs=0
   fi
 
-  # 1) Remux locally
   log "$(ts) REMUX : $n"
   if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c copy "$tmp"; then
     rm -f "$tmp"
@@ -253,22 +311,16 @@ process_one_mkv() {
     fi
   fi
 
-  # 2) Faststart (skip if remux-only mode or already faststart)
-  if [[ "${MODE:-both}" == "remux" ]]; then
-    log "$(ts) MOVE  : $n"
-    mv -f "$tmp" "$out"
-  elif is_faststart "$tmp"; then
-    log "$(ts) MOVE  : $n"
+  if [[ "${MODE:-both}" == "remux" ]] || is_faststart "$tmp"; then
     mv -f "$tmp" "$out"
   else
     log "$(ts) FAST  : $n"
     ff_run -y -i "$tmp" -map 0 -c copy -movflags +faststart "$tmpfs"
-    log "$(ts) MOVE  : $n"
     mv -f "$tmpfs" "$out"
     rm -f "$tmp" || true
   fi
 
-  # 3) Extract text subtitles to sidecar SRTs
+  # Extract text subtitles to sidecar SRTs
   local subcodecs
   subcodecs="$("$FFPROBE" -v error -select_streams s \
       -show_entries stream=index,codec_name:stream_tags=language \
@@ -291,74 +343,56 @@ process_one_mkv() {
           ;;
       esac
     done <<< "$subcodecs"
-
     if [[ "${#srt_args[@]}" -gt 0 ]]; then
       "$FFMPEG" -nostdin -hide_banner -loglevel error -y -i "$file" "${srt_args[@]}" || true
       log "$(ts) SUBS  : $i track(s) — $n"
-    else
-      log "$(ts) SUBS  : none — $n"
     fi
   fi
 
-  # 4) Delete MKV if MP4 created
   local end elapsed
-  end="$(date +%s)"
-  elapsed=$((end-start))
+  end="$(date +%s)"; elapsed=$((end-start))
 
   if [[ -s "$out" ]]; then
-    if [[ "$DELETE_SOURCE" == "1" ]]; then
-      rm -f "$file"
-    fi
-    log "$(ts) DONE  : ${elapsed}s  [$(fsize "$out")]  $n"
+    handle_source "$file" "$out" "$rel" "$elapsed"
   else
     log "$(ts) WARN  : output MP4 empty, keeping source — $n"
     problem "$file" "WARN: output MP4 missing or empty — conversion may have failed"
   fi
 }
 
+# ── Process existing MP4 (faststart fix only) ────────────────────────────────
 process_one_mp4() {
-  local _src="$1" _dst="$2" file="$3"
+  local src="$1" file="$2"
 
-  if [[ "${MODE:-both}" == "remux" ]]; then
-    return 0
-  fi
+  if [[ "${MODE:-both}" == "remux" ]]; then return 0; fi
+  if is_faststart "$file"; then return 0; fi
 
-  # Only fix moov placement if needed
-  if is_faststart "$file"; then
-    return 0
-  fi
+  if check_stop_requested; then return 0; fi
 
-  local start end elapsed tmpout n
+  local start n tmpout
   start="$(date +%s)"
   n="$(sname "$file")"
   log "$(ts) FAST  : [$(fsize "$file")]  $n"
 
   tmpout="${file}.faststart.tmp.mp4"
   rm -f "$tmpout" || true
-
-  ff_run -y -i "$file" -map 0:v -map 0:a -map 0:s? -c copy -movflags +faststart "$tmpout"
-  log "$(ts) MOVE  : $n"
+  ff_run -y -i "$file" -map 0:v -map 0:a? -map 0:s? -c copy -movflags +faststart "$tmpout"
   mv -f "$tmpout" "$file"
 
-  end="$(date +%s)"
-  elapsed=$((end-start))
+  local end elapsed
+  end="$(date +%s)"; elapsed=$((end-start))
   log "$(ts) DONE  : ${elapsed}s  [$(fsize "$file")]  $n"
 }
 
-# Handler for legacy formats: AVI, MPG/MPEG, WMV
-# - WMV/VC1 codecs are MP4-incompatible and are transcoded immediately (libx264 + AAC)
-# - Everything else tries stream copy, then audio-transcode fallback, then full transcode
+# ── Process legacy formats (AVI, MPG, WMV) ───────────────────────────────────
 process_one_legacy() {
-  local src="$1" dst="$2" file="$3"
-  local ext="${file##*.}"
+  local src="$1" file="$2"
 
-  if [[ "${MODE:-both}" == "faststart" ]]; then
-    return 0
-  fi
+  if [[ "${MODE:-both}" == "faststart" ]]; then return 0; fi
 
-  local rel out base tmp tmpfs start n
+  local rel out n
   rel="${file#"$src"/}"
-  out="$dst/${rel%.*}.mp4"
+  out="$(output_path "$src" "$file" .mp4)"
   n="$(sname "$file")"
 
   mkdir -p "$(dirname "$out")"
@@ -370,11 +404,12 @@ process_one_legacy() {
 
   if check_stop_requested; then return 0; fi
 
+  local base tmp tmpfs start
   base="$(basename "${out%.mp4}")"
   tmp="$TMPROOT/${base}.$$.$RANDOM.mp4"
   tmpfs="$TMPROOT/${base}.$$.$RANDOM.fs.mp4"
-
   start="$(date +%s)"
+
   log "$(ts) START : [$(fsize "$file")]  $n"
 
   local dur_raw dur_secs
@@ -385,7 +420,6 @@ process_one_legacy() {
     dur_secs=0
   fi
 
-  # 1) Remux/encode locally
   if needs_transcode_video "$file"; then
     log "$(ts) XCODE : WMV/VC1 — $n"
     if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
@@ -396,7 +430,8 @@ process_one_legacy() {
     fi
   else
     log "$(ts) REMUX : $n"
-    if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c:v copy -c:a aac -b:a 384k "$tmp"; then
+    if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
+        -c:v copy -c:a aac -b:a 384k "$tmp"; then
       rm -f "$tmp"
       log "$(ts) XCODE : remux failed, transcoding — $n"
       if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
@@ -409,31 +444,20 @@ process_one_legacy() {
     fi
   fi
 
-  # 2) Faststart (skip if remux-only mode or already faststart)
-  if [[ "${MODE:-both}" == "remux" ]]; then
-    log "$(ts) MOVE  : $n"
-    mv -f "$tmp" "$out"
-  elif is_faststart "$tmp"; then
-    log "$(ts) MOVE  : $n"
+  if [[ "${MODE:-both}" == "remux" ]] || is_faststart "$tmp"; then
     mv -f "$tmp" "$out"
   else
     log "$(ts) FAST  : $n"
     ff_run -y -i "$tmp" -map 0 -c copy -movflags +faststart "$tmpfs"
-    log "$(ts) MOVE  : $n"
     mv -f "$tmpfs" "$out"
     rm -f "$tmp" || true
   fi
 
-  # 3) Delete source if MP4 created successfully
   local end elapsed
-  end="$(date +%s)"
-  elapsed=$((end-start))
+  end="$(date +%s)"; elapsed=$((end-start))
 
   if [[ -s "$out" ]]; then
-    if [[ "$DELETE_SOURCE" == "1" ]]; then
-      rm -f "$file"
-    fi
-    log "$(ts) DONE  : ${elapsed}s  [$(fsize "$out")]  $n"
+    handle_source "$file" "$out" "$rel" "$elapsed"
   else
     log "$(ts) WARN  : output MP4 empty, keeping source — $n"
     problem "$file" "WARN: output MP4 missing or empty — conversion may have failed"
@@ -441,32 +465,38 @@ process_one_legacy() {
 }
 
 process_one() {
-  local src="$1" dst="$2" file="$3"
+  local src="$1" file="$2"
   case "${file##*.}" in
-    mkv|MKV)                          process_one_mkv    "$src" "$dst" "$file" ;;
-    mp4|MP4)                          process_one_mp4    "$src" "$dst" "$file" ;;
-    avi|AVI|mpg|MPG|mpeg|MPEG|wmv|WMV) process_one_legacy "$src" "$dst" "$file" ;;
+    mkv|MKV)                           process_one_mkv    "$src" "$file" ;;
+    mp4|MP4)                           process_one_mp4    "$src" "$file" ;;
+    avi|AVI|mpg|MPG|mpeg|MPEG|wmv|WMV) process_one_legacy "$src" "$file" ;;
   esac
 }
 
-export -f process_one process_one_mkv process_one_mp4 process_one_legacy \
+export -f process_one process_one_mkv process_one_mp4 process_one_legacy handle_source output_path \
            needs_transcode_video log ts ff_run ff_run_progress is_faststart problem fsize sname \
            check_stop_requested
-export FFMPEG FFPROBE TMPROOT DELETE_SOURCE DELETE_SOURCE_SET MODE PROBLEM_LOG STOP_FILE TTY
+export FFMPEG FFPROBE TMPROOT SOURCE_ACTION ARCHIVE_DIR \
+       OUTPUT_MODE OUTPUT_DIR OUTPUT_FLAT MODE PROBLEM_LOG STOP_FILE TTY JOBS
 
-log "SRC:  $SRC"
-log "DST:  $DST"
-log "JOBS: $JOBS"
-log "MODE: $MODE"
-log "STOP: touch $STOP_FILE   (completes in-progress files, skips the rest)"
+log ""
+log "SRC:       $SRC"
+log "MODE:      $MODE"
+log "OUTPUT:    $( [[ "$OUTPUT_MODE" == "separate" ]] && echo "$OUTPUT_DIR ($( [[ $OUTPUT_FLAT == 1 ]] && echo flat || echo mirrored ))" || echo "in place" )"
+log "ORIGINALS: $( case "$SOURCE_ACTION" in archive) echo "archive → $ARCHIVE_DIR" ;; delete) echo "delete" ;; keep) echo "keep" ;; esac )"
+log "JOBS:      $JOBS"
+log "STOP:      touch $STOP_FILE   (finish current file, skip the rest)"
+log "           rm $STOP_FILE      (clear stop flag to re-run)"
+log ""
 
 find "$SRC" \
-  \( -name '.Trashes' -o -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.TemporaryItems' \) -prune \
+  \( -name '.Trashes' -o -name '.Spotlight-V100' -o -name '.fseventsd' -o -name '.TemporaryItems' \
+     -o -name 'originals' -o -name 'new versions' -o -name 'Library' \) -prune \
   -o \( -type f -not -name '._*' \
         \( -iname "*.mkv" -o -iname "*.mp4" \
            -o -iname "*.avi" -o -iname "*.mpg" -o -iname "*.mpeg" -o -iname "*.wmv" \) \
         -print0 \) \
-  | xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$@"' _ "$SRC" "$DST"
+  | xargs -0 -n 1 -P "$JOBS" bash -c 'process_one "$@"' _ "$SRC"
 
 if [[ -s "$PROBLEM_LOG" ]]; then
   count="$(wc -l < "$PROBLEM_LOG" | tr -d ' ')"

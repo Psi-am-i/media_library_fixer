@@ -7,11 +7,13 @@ Converts MKV, AVI, MPG, WMV, and MP4 files to faststart-compatible MP4 using FFm
 - **Three modes** — remux-only, faststart-only, or both
 - **Smart remux** — stream-copies video and audio; falls back to AAC if the audio codec is incompatible with MP4
 - **Faststart detection** — inspects the `moov`/`mdat` atom order and skips the faststart pass if it is already correct
+- **Video-only support** — audio and subtitle maps use optional (`?`) flags so video-only files are handled without errors
 - **Subtitle extraction** — exports text-based subtitle tracks (SRT, ASS, WebVTT, MOV_TEXT) to sidecar `.srt` files alongside the output
 - **Legacy format support** — AVI, MPG/MPEG, WMV including VC-1/WMV3 codecs that cannot be stream-copied (re-encoded via libx264)
 - **Parallel processing** — configurable job count for concurrent conversions via `xargs -P`
 - **Local temp processing** — remux/encode runs in `/tmp/mp4work` before being moved to the destination, keeping the network path free of partial writes
-- **Problem summary** — prints a consolidated list of files that need attention at the end of each run, so you don't have to trawl logs
+- **Safe from home directory** — `~/Library` and other macOS system folders are excluded from the `find` scan
+- **Problem summary** — prints a consolidated list of files that need attention at the end of each run
 
 ## Requirements
 
@@ -22,41 +24,29 @@ Converts MKV, AVI, MPG, WMV, and MP4 files to faststart-compatible MP4 using FFm
 ## Usage
 
 ```bash
-./mkv_2_mp4_faststart.sh [SRC] [DST] [JOBS]
+./everything_2_faststart_mp4.sh [SRC]
 ```
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `SRC` | `.` | Source directory to scan recursively |
-| `DST` | Same as `SRC` | Destination root for output MP4s (directory structure is preserved) |
-| `JOBS` | `2` | Number of parallel conversion jobs |
+`SRC` is the directory to scan recursively (default: current directory). The script prompts interactively for all options on startup:
 
-The script prompts interactively for mode and delete-source preference on first run. Set the environment variables below to skip prompts for scripted/scheduled use.
+- **Processing mode** — remux only / faststart only / both
+- **Output location** — in place, or a separate folder (flat or mirrored structure)
+- **Original handling** — archive to a folder, delete, or leave in place
+- **Parallel jobs** — 1, 2, or 4
+
+### Graceful stop
+
+```bash
+touch /tmp/mp4_stop   # finish current file(s), skip the rest
+rm /tmp/mp4_stop      # clear the stop flag to resume/re-run
+```
 
 ### Environment variables
 
-| Variable | Values | Description |
-|----------|--------|-------------|
-| `MODE` | `remux` / `faststart` / `both` | Processing mode — skips the interactive prompt |
-| `DELETE_SOURCE` | `0` / `1` | Remove source file after a successful conversion |
-| `DELETE_SOURCE_SET` | any non-empty value | Set to skip the delete-source prompt |
-| `FFMPEG` | path | Override the `ffmpeg` binary location |
-| `FFPROBE` | path | Override the `ffprobe` binary location |
-
-### Examples
-
-```bash
-# Interactive — prompts for mode and whether to keep or delete the source
-./mkv_2_mp4_faststart.sh /Volumes/NAS/TV
-
-# Remux all files in one directory to another, 4 parallel jobs, non-interactive
-MODE=remux DELETE_SOURCE=0 DELETE_SOURCE_SET=1 \
-  ./mkv_2_mp4_faststart.sh /Volumes/NAS/TV /Volumes/Output/TV 4
-
-# Faststart-only pass over an existing MP4 library (in-place)
-MODE=faststart DELETE_SOURCE=0 DELETE_SOURCE_SET=1 \
-  ./mkv_2_mp4_faststart.sh /Volumes/NAS/Movies
-```
+| Variable | Description |
+|----------|-------------|
+| `FFMPEG` | Override the `ffmpeg` binary path |
+| `FFPROBE` | Override the `ffprobe` binary path |
 
 ## Processing modes
 
