@@ -315,7 +315,6 @@ process_one_mkv() {
 
   if needs_transcode_video "$file"; then
     log "$(ts) XCODE : WMV/VC1 in MKV — $n"
-    problem "$file" "VIDEO: codec not MP4-compatible; transcoded to H.264+AAC"
     local src_bps xwidth maxrate bufsize
     src_bps="$(probe_video_field "$file" bit_rate)"
     xwidth="$(probe_video_field "$file" width)"
