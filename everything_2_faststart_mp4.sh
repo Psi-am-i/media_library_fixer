@@ -82,6 +82,10 @@ export JOBS
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
 
+# Transcode bitrate caps — used as -maxrate ceiling when source bitrate is unknown
+XCODE_BITRATE_CAP_HD=8000    # kbps, for content < 3840px wide
+XCODE_BITRATE_CAP_4K=20000   # kbps, for 4K content
+
 mkdir -p "$TMPROOT"
 
 PROBLEM_LOG="$(mktemp /tmp/remux_problems.XXXXXX)"
@@ -209,6 +213,17 @@ PY
 }
 export -f is_faststart
 
+probe_video_field() {
+  "$FFPROBE" -v error -select_streams v:0 \
+    -show_entries "stream=$2" -of csv=p=0 "$1" | head -1
+}
+export -f probe_video_field
+
+probe_container_bitrate() {
+  "$FFPROBE" -v error -show_entries format=bit_rate -of csv=p=0 "$1" | head -1
+}
+export -f probe_container_bitrate
+
 # Returns 0 if the primary video codec cannot be stream-copied into MP4
 needs_transcode_video() {
   local f="$1"
@@ -298,16 +313,40 @@ process_one_mkv() {
     dur_secs=0
   fi
 
-  log "$(ts) REMUX : $n"
-  if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c copy "$tmp"; then
-    rm -f "$tmp"
-    log "$(ts) AUDIO : stream-copy failed, re-encoding audio — $n"
-    problem "$file" "AUDIO: stream-copy remux failed; audio re-encoded to AAC"
-    if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c:v copy -c:a aac -b:a 384k "$tmp"; then
+  if needs_transcode_video "$file"; then
+    log "$(ts) XCODE : WMV/VC1 in MKV — $n"
+    problem "$file" "VIDEO: codec not MP4-compatible; transcoded to H.264+AAC"
+    local src_bps xwidth maxrate bufsize
+    src_bps="$(probe_video_field "$file" bit_rate)"
+    xwidth="$(probe_video_field "$file" width)"
+    [[ -z "$src_bps" || "$src_bps" == "N/A" ]] && src_bps="$(probe_container_bitrate "$file")"
+    if [[ -n "$src_bps" && "$src_bps" =~ ^[0-9]+$ ]]; then
+      maxrate="$(( src_bps / 1000 ))k"
+    else
+      maxrate="$( [[ "${xwidth:-0}" -ge 3840 ]] && echo "${XCODE_BITRATE_CAP_4K}k" || echo "${XCODE_BITRATE_CAP_HD}k" )"
+      log "$(ts) WARN  : could not probe source bitrate, using cap ($maxrate) — $n"
+    fi
+    bufsize="$(python3 -c "print(str(int('${maxrate%k}') * 2) + 'k')")"
+    if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
+        -c:v libx264 -crf 18 -preset slow -maxrate "$maxrate" -bufsize "$bufsize" \
+        -c:a aac -b:a 384k "$tmp"; then
       rm -f "$tmp"
-      log "$(ts) ERROR : all remux strategies failed — $n"
-      problem "$file" "ERROR: all remux strategies failed"
+      log "$(ts) ERROR : transcode failed — $n"
+      problem "$file" "ERROR: transcode failed"
       return 1
+    fi
+  else
+    log "$(ts) REMUX : $n"
+    if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c copy "$tmp"; then
+      rm -f "$tmp"
+      log "$(ts) AUDIO : stream-copy failed, re-encoding audio — $n"
+      problem "$file" "AUDIO: stream-copy remux failed; audio re-encoded to AAC"
+      if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a -c:v copy -c:a aac -b:a 384k "$tmp"; then
+        rm -f "$tmp"
+        log "$(ts) ERROR : all remux strategies failed — $n"
+        problem "$file" "ERROR: all remux strategies failed"
+        return 1
+      fi
     fi
   fi
 
@@ -420,10 +459,23 @@ process_one_legacy() {
     dur_secs=0
   fi
 
+  local src_bps xwidth maxrate bufsize
+  src_bps="$(probe_video_field "$file" bit_rate)"
+  xwidth="$(probe_video_field "$file" width)"
+  [[ -z "$src_bps" || "$src_bps" == "N/A" ]] && src_bps="$(probe_container_bitrate "$file")"
+  if [[ -n "$src_bps" && "$src_bps" =~ ^[0-9]+$ ]]; then
+    maxrate="$(( src_bps / 1000 ))k"
+  else
+    maxrate="$( [[ "${xwidth:-0}" -ge 3840 ]] && echo "${XCODE_BITRATE_CAP_4K}k" || echo "${XCODE_BITRATE_CAP_HD}k" )"
+    log "$(ts) WARN  : could not probe source bitrate, using cap ($maxrate) — $n"
+  fi
+  bufsize="$(python3 -c "print(str(int('${maxrate%k}') * 2) + 'k')")"
+
   if needs_transcode_video "$file"; then
     log "$(ts) XCODE : WMV/VC1 — $n"
     if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
-        -c:v libx264 -crf 18 -preset slow -c:a aac -b:a 384k "$tmp"; then
+        -c:v libx264 -crf 18 -preset slow -maxrate "$maxrate" -bufsize "$bufsize" \
+        -c:a aac -b:a 384k "$tmp"; then
       rm -f "$tmp"
       log "$(ts) ERROR : transcode failed — $n"
       return 1
@@ -435,7 +487,8 @@ process_one_legacy() {
       rm -f "$tmp"
       log "$(ts) XCODE : remux failed, transcoding — $n"
       if ! ff_run_progress "$n" "$dur_secs" "$start" -y -i "$file" -map 0:v -map 0:a \
-          -c:v libx264 -crf 18 -preset slow -c:a aac -b:a 384k "$tmp"; then
+          -c:v libx264 -crf 18 -preset slow -maxrate "$maxrate" -bufsize "$bufsize" \
+          -c:a aac -b:a 384k "$tmp"; then
         rm -f "$tmp"
         log "$(ts) ERROR : all strategies failed — $n"
         problem "$file" "ERROR: all encode strategies failed — file skipped"
@@ -474,10 +527,12 @@ process_one() {
 }
 
 export -f process_one process_one_mkv process_one_mp4 process_one_legacy handle_source output_path \
-           needs_transcode_video log ts ff_run ff_run_progress is_faststart problem fsize sname \
+           needs_transcode_video probe_video_field probe_container_bitrate \
+           log ts ff_run ff_run_progress is_faststart problem fsize sname \
            check_stop_requested
 export FFMPEG FFPROBE TMPROOT SOURCE_ACTION ARCHIVE_DIR \
-       OUTPUT_MODE OUTPUT_DIR OUTPUT_FLAT MODE PROBLEM_LOG STOP_FILE TTY JOBS
+       OUTPUT_MODE OUTPUT_DIR OUTPUT_FLAT MODE PROBLEM_LOG STOP_FILE TTY JOBS \
+       XCODE_BITRATE_CAP_HD XCODE_BITRATE_CAP_4K
 
 log ""
 log "SRC:       $SRC"
