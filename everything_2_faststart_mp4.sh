@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-# everything_2_faststart_mp4.sh — Convert/remux video files to faststart MP4
+# media_library_fixer.sh — Convert/remux video files to faststart MP4
 #
 # USAGE:
-#   ./everything_2_faststart_mp4.sh [SRC]
+#   ./media_library_fixer.sh [SRC]
 #
 #   SRC   Directory to scan (default: current directory)
 #
