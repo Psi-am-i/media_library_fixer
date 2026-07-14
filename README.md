@@ -1,6 +1,9 @@
-# everything_2_faststart_mp4
+# media_library_fixer (or remux_&_faststart_everything_2_mp4)
 
-Converts MKV, AVI, MPG, WMV, and MP4 files to faststart-compatible MP4 using FFmpeg. Built for media libraries on network drives — all transcoding happens locally on the machine running the script, then the output is moved to its destination, keeping network write traffic to a single sequential pass.
+- Get your media library working on almost any device, start streaming quickly and lose zero quality!
+- Converts MKV, AVI, MPG, WMV, and MP4 files to faststart-compatible MP4 using FFmpeg. Files are remuxed instead of transcoded (the audio and video are put into a new container but otherwise untouched).
+- If source files use a codec that cannot be put into an MP4 (mainly old files), then they will be transcoded - but this is the only circumstance.
+- Built for media libraries on network drives — all remuxing or transcoding happens locally on the machine running the script, then the output is moved to its destination, keeping network write traffic to a single sequential pass.
 
 ## Features
 
